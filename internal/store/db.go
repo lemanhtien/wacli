@@ -2,6 +2,7 @@ package store
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -130,6 +131,14 @@ func (d *DB) detectMessagesFTS() bool {
 	if err != nil || !hasDisplayText {
 		return false
 	}
+	// Smoke-test that the FTS index is actually queryable (not corrupt) without
+	// scanning it. A bare `count(*)` over messages_fts makes FTS5 walk the whole
+	// index — on a multi-GB store that costs several seconds on *every* open and
+	// was the dominant cost of `wacli auth` startup (the QR only needs
+	// session.db, but App.New opens this index eagerly). `LIMIT 1` reads at most
+	// one row; an empty-but-valid index returns sql.ErrNoRows, which still means
+	// "queryable".
 	var n int
-	return d.sql.QueryRow("SELECT count(*) FROM messages_fts").Scan(&n) == nil
+	err = d.sql.QueryRow("SELECT 1 FROM messages_fts LIMIT 1").Scan(&n)
+	return err == nil || errors.Is(err, sql.ErrNoRows)
 }
