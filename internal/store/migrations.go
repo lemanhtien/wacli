@@ -33,6 +33,7 @@ var schemaMigrations = []migration{
 	{version: 17, name: "status messages", up: migrateStatusMessages},
 	{version: 18, name: "chat unread count column", up: migrateChatUnreadCountColumn},
 	{version: 19, name: "messages quoted columns", up: migrateMessagesQuotedColumns},
+	{version: 20, name: "messages @lid partial indexes", up: migrateMessagesLIDPartialIndexes},
 }
 
 func (d *DB) ensureSchema() error {
@@ -580,6 +581,37 @@ func migrateMessagesFTS(d *DB) error {
 	}
 
 	d.ftsEnabled = true
+	return nil
+}
+
+// migrateMessagesLIDPartialIndexes creates partial indexes covering only the
+// hidden-user (@lid) rows of the messages table. HistoricalLIDJIDs runs on
+// every `sync`/`auth` startup and probes for leftover @lid JIDs with
+// `WHERE <col> GLOB '*@lid'`. A leading-wildcard GLOB cannot use an ordinary
+// index, so without these the probe forced a full scan of the entire messages
+// table (multi-GB) before the websocket even dialed — the dominant cost of
+// cold-connect startup. @lid rows are rare, so the partial indexes are tiny and
+// SQLite answers the probe with a covering scan of the small index instead of
+// the whole table. Building them is a one-time full scan; every open after is
+// O(@lid rows).
+func migrateMessagesLIDPartialIndexes(d *DB) error {
+	exists, err := d.tableExists("messages")
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return nil
+	}
+	if _, err := d.sql.Exec(`
+		CREATE INDEX IF NOT EXISTS idx_messages_chat_jid_lid
+			ON messages(chat_jid) WHERE chat_jid GLOB '*@lid';
+		CREATE INDEX IF NOT EXISTS idx_messages_sender_jid_lid
+			ON messages(sender_jid) WHERE sender_jid GLOB '*@lid';
+		CREATE INDEX IF NOT EXISTS idx_messages_quoted_sender_jid_lid
+			ON messages(quoted_sender_jid) WHERE quoted_sender_jid GLOB '*@lid';
+	`); err != nil {
+		return fmt.Errorf("create messages @lid partial indexes: %w", err)
+	}
 	return nil
 }
 

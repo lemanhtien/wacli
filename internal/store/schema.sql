@@ -95,6 +95,13 @@ CREATE TABLE IF NOT EXISTS messages (
 CREATE INDEX IF NOT EXISTS idx_messages_chat_ts ON messages(chat_jid, ts);
 CREATE INDEX IF NOT EXISTS idx_messages_ts ON messages(ts);
 
+-- Partial indexes over only the hidden-user (@lid) rows so HistoricalLIDJIDs'
+-- `WHERE <col> GLOB '*@lid'` probe (run on every sync/auth startup) is answered
+-- by a tiny covering index scan instead of a full messages table scan.
+CREATE INDEX IF NOT EXISTS idx_messages_chat_jid_lid ON messages(chat_jid) WHERE chat_jid GLOB '*@lid';
+CREATE INDEX IF NOT EXISTS idx_messages_sender_jid_lid ON messages(sender_jid) WHERE sender_jid GLOB '*@lid';
+CREATE INDEX IF NOT EXISTS idx_messages_quoted_sender_jid_lid ON messages(quoted_sender_jid) WHERE quoted_sender_jid GLOB '*@lid';
+
 CREATE TABLE IF NOT EXISTS status_messages (
     rowid INTEGER PRIMARY KEY AUTOINCREMENT,
     msg_id TEXT NOT NULL UNIQUE,

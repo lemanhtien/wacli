@@ -2,6 +2,7 @@ package store
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
@@ -65,6 +66,46 @@ func TestHistoricalLIDJIDsFindsChatAndMessageColumns(t *testing.T) {
 	}
 	if want := []string{lid}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("HistoricalLIDJIDs = %#v, want %#v", got, want)
+	}
+}
+
+// TestHistoricalLIDProbeUsesPartialIndex locks in the perf guarantee: the
+// per-startup @lid probe must be answered by the partial covering indexes
+// (migration 20), never by a full scan of the messages table. Without these
+// indexes the GLOB '*@lid' probe full-scans the entire table — the cold-connect
+// IO storm this migration exists to kill.
+func TestHistoricalLIDProbeUsesPartialIndex(t *testing.T) {
+	db := openTestDB(t)
+	cases := []struct {
+		col, index string
+	}{
+		{"chat_jid", "idx_messages_chat_jid_lid"},
+		{"sender_jid", "idx_messages_sender_jid_lid"},
+		{"quoted_sender_jid", "idx_messages_quoted_sender_jid_lid"},
+	}
+	for _, c := range cases {
+		query := "SELECT " + c.col + " FROM messages WHERE " + c.col + " GLOB '*@lid'"
+		rows, err := db.sql.Query("EXPLAIN QUERY PLAN " + query)
+		if err != nil {
+			t.Fatalf("EXPLAIN QUERY PLAN %s: %v", c.col, err)
+		}
+		var plan string
+		for rows.Next() {
+			var id, parent, notused int
+			var detail string
+			if err := rows.Scan(&id, &parent, &notused, &detail); err != nil {
+				rows.Close()
+				t.Fatalf("scan plan row: %v", err)
+			}
+			plan += detail + "\n"
+		}
+		rows.Close()
+		if !strings.Contains(plan, c.index) {
+			t.Fatalf("probe on %s did not use %s; plan was:\n%s", c.col, c.index, plan)
+		}
+		if strings.Contains(plan, "SCAN messages\n") || strings.HasSuffix(strings.TrimSpace(plan), "SCAN messages") {
+			t.Fatalf("probe on %s full-scanned the messages table; plan was:\n%s", c.col, plan)
+		}
 	}
 }
 
