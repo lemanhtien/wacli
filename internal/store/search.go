@@ -101,7 +101,13 @@ func (d *DB) searchFTS(p SearchMessagesParams) ([]Message, error) {
 	// as implicit AND (both words present, any order).
 	args := []interface{}{sanitizeFTSQuery(p.Query)}
 	query, args = applyMessageFilters(query, args, p)
-	query += " ORDER BY bm25(messages_fts), m.rowid DESC LIMIT ?"
+	// Order by rowid DESC (newest-first), not bm25: relevance ranking forces
+	// SQLite to score and JOIN every matching row before LIMIT applies, which
+	// on a multi-GB store with a high-frequency token means hundreds of
+	// thousands of cold random reads (~220s measured on a 29GB DB with 123k
+	// matches). FTS5 walks posting lists in rowid order natively, so this
+	// terminates after LIMIT rows (~0.1s on the same query).
+	query += " ORDER BY messages_fts.rowid DESC LIMIT ?"
 	args = append(args, p.Limit)
 	return d.scanMessages(query, args...)
 }
