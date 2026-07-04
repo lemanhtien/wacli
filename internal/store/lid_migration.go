@@ -247,10 +247,19 @@ func migrateLIDMessagesToPN(tx *sql.Tx, lidJID, pnJID string) error {
 }
 
 func migrateLIDSenderToPN(tx *sql.Tx, lidJID, pnJID string) error {
-	if _, err := tx.Exec(`UPDATE messages SET sender_jid = ? WHERE sender_jid = ?`, pnJID, lidJID); err != nil {
+	// There is no regular index on sender_jid/quoted_sender_jid, so a bare
+	// `<col> = ?` predicate is a full scan of the messages table — hours on a
+	// multi-GB store, inside this write transaction, once per historical LID.
+	// The partial @lid indexes (migration 20) cover exactly the rows these
+	// UPDATEs can touch, but the planner only applies a partial index when the
+	// WHERE clause restates its predicate verbatim — a bound parameter that
+	// happens to end in @lid does not qualify. Callers only ever pass @lid JIDs
+	// (migrateHistoricalLIDs filters on HiddenUserServer), so adding the GLOB
+	// keeps semantics identical and turns each scan into an index seek.
+	if _, err := tx.Exec(`UPDATE messages SET sender_jid = ? WHERE sender_jid = ? AND sender_jid GLOB '*@lid'`, pnJID, lidJID); err != nil {
 		return fmt.Errorf("rewrite lid message senders: %w", err)
 	}
-	if _, err := tx.Exec(`UPDATE messages SET quoted_sender_jid = ? WHERE quoted_sender_jid = ?`, pnJID, lidJID); err != nil {
+	if _, err := tx.Exec(`UPDATE messages SET quoted_sender_jid = ? WHERE quoted_sender_jid = ? AND quoted_sender_jid GLOB '*@lid'`, pnJID, lidJID); err != nil {
 		return fmt.Errorf("rewrite lid quoted message senders: %w", err)
 	}
 	return nil

@@ -109,6 +109,52 @@ func TestHistoricalLIDProbeUsesPartialIndex(t *testing.T) {
 	}
 }
 
+// TestMigrateLIDSenderRewriteUsesPartialIndex locks in the companion perf
+// guarantee: the sender/quoted-sender rewrites inside MigrateLIDToPN must also
+// be answered by the partial @lid indexes. A bare `<col> = ?` predicate cannot
+// use them (the planner needs the index's GLOB expression verbatim in the
+// WHERE clause), so each rewrite full-scanned the messages table — hours per
+// historical LID on a multi-GB store, inside a write transaction, on every
+// sync/auth startup that found @lid rows.
+func TestMigrateLIDSenderRewriteUsesPartialIndex(t *testing.T) {
+	db := openTestDB(t)
+	cases := []struct {
+		query, index string
+	}{
+		{
+			"UPDATE messages SET sender_jid = ? WHERE sender_jid = ? AND sender_jid GLOB '*@lid'",
+			"idx_messages_sender_jid_lid",
+		},
+		{
+			"UPDATE messages SET quoted_sender_jid = ? WHERE quoted_sender_jid = ? AND quoted_sender_jid GLOB '*@lid'",
+			"idx_messages_quoted_sender_jid_lid",
+		},
+	}
+	for _, c := range cases {
+		rows, err := db.sql.Query("EXPLAIN QUERY PLAN "+c.query, "15551234567@s.whatsapp.net", "999123456789@lid")
+		if err != nil {
+			t.Fatalf("EXPLAIN QUERY PLAN %s: %v", c.query, err)
+		}
+		var plan string
+		for rows.Next() {
+			var id, parent, notused int
+			var detail string
+			if err := rows.Scan(&id, &parent, &notused, &detail); err != nil {
+				rows.Close()
+				t.Fatalf("scan plan row: %v", err)
+			}
+			plan += detail + "\n"
+		}
+		rows.Close()
+		if !strings.Contains(plan, c.index) {
+			t.Fatalf("rewrite did not use %s; plan was:\n%s", c.index, plan)
+		}
+		if strings.Contains(plan, "SCAN messages\n") || strings.HasSuffix(strings.TrimSpace(plan), "SCAN messages") {
+			t.Fatalf("rewrite full-scanned the messages table; plan was:\n%s", plan)
+		}
+	}
+}
+
 func TestMigrateLIDToPNMergesChatsAndMessages(t *testing.T) {
 	db := openTestDB(t)
 	base := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
