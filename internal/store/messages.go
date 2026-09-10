@@ -3,6 +3,7 @@ package store
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -50,6 +51,39 @@ func snippetSQL(snippet string) string {
 		return "''"
 	}
 	return snippet
+}
+
+// MessageExists reports whether a message row already exists. It hits the
+// UNIQUE(chat_jid, msg_id) index only, so it is O(log n) even on a multi-GB
+// store, which makes it cheap enough to run before any per-message network or
+// contact work during a history replay.
+func (d *DB) MessageExists(chatJID, msgID string) (bool, error) {
+	var n int
+	err := d.sql.QueryRowContext(storeCtx(), `SELECT 1 FROM messages WHERE chat_jid = ? AND msg_id = ? LIMIT 1`, chatJID, msgID).Scan(&n)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
+// UpsertMessages writes a batch of messages inside one transaction. Batching
+// the rows of a history conversation turns N autocommit fsyncs into one and
+// lets the live message path interleave between batches.
+func (d *DB) UpsertMessages(ps []UpsertMessageParams) error {
+	if len(ps) == 0 {
+		return nil
+	}
+	return d.WithTx(func(tx *DB) error {
+		for _, p := range ps {
+			if err := tx.UpsertMessage(p); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 }
 
 func (d *DB) UpsertMessage(p UpsertMessageParams) error {

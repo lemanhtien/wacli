@@ -76,8 +76,15 @@ func (d *DB) validateReadable() error {
 }
 
 func sqliteURI(path string, readOnly bool) string {
-	params := "_foreign_keys=on&_busy_timeout=5000"
+	// The writable connection is shared by the live message path, the history
+	// replay worker and the media workers. A busy wait shorter than a batched
+	// history transaction lets a realtime insert fail with SQLITE_BUSY, and a
+	// dropped realtime message is far worse than a slow one, so writers wait
+	// up to 30s. Read-only openers keep the short timeout so a wedged writer
+	// cannot hang read-only CLI commands for long.
+	params := "_foreign_keys=on&_busy_timeout=30000"
 	if readOnly {
+		params = "_foreign_keys=on&_busy_timeout=5000"
 		params += "&mode=ro&_query_only=1"
 		if !sqliteSidecarsExist(path) {
 			params += "&immutable=1"
