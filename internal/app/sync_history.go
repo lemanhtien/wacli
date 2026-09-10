@@ -49,9 +49,11 @@ type historyJob struct {
 // the download and the store work.
 //
 // Shutdown: stop cancels the worker context and waits. The worker finishes the
-// batch it is writing (under context.WithoutCancel) and discards the rest of
-// the queue; chunks it did not get to are re-sent by the server on the next
-// history sync.
+// conversation it is writing (under context.WithoutCancel) and discards the
+// rest of the queue. Those chunks are NOT re-sent: whatsmeow acked their
+// notification when it was decrypted, so a shutdown mid-replay loses them
+// (same as the old inline path being killed) and only `history backfill` can
+// ask for that range again.
 func (a *App) runHistoryWorker(ctx context.Context, opts SyncOptions, messagesStored, lastEvent *atomic.Int64, enqueueMedia func(string, string), limits *syncStorageLimits) (enqueue func(historyJob), stop func()) {
 	jobs := make(chan historyJob, historyQueueSize)
 	workerCtx, cancel := context.WithCancel(ctx)

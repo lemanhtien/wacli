@@ -82,7 +82,11 @@ func sqliteURI(path string, readOnly bool) string {
 	// dropped realtime message is far worse than a slow one, so writers wait
 	// up to 30s. Read-only openers keep the short timeout so a wedged writer
 	// cannot hang read-only CLI commands for long.
-	params := "_foreign_keys=on&_busy_timeout=30000"
+	// _txlock=immediate: every BEGIN takes the write lock up front, through
+	// the busy handler. A deferred transaction that reads first (the history
+	// batch looks up quoted rows) and then writes fails with SQLITE_BUSY the
+	// moment another writer committed in between, without ever waiting.
+	params := "_foreign_keys=on&_busy_timeout=30000&_txlock=immediate"
 	if readOnly {
 		params = "_foreign_keys=on&_busy_timeout=5000"
 		params += "&mode=ro&_query_only=1"
