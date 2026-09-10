@@ -116,7 +116,15 @@ func (a *App) Sync(ctx context.Context, opts SyncOptions) (SyncResult, error) {
 		defer stopWebhook()
 	}
 
-	handlerID := a.addSyncEventHandler(syncCtx, opts, &messagesStored, &lastEvent, disconnected, enqueueMedia, enqueueWebhook, limits)
+	// History chunks are replayed by one dedicated worker so the whatsmeow node
+	// handler returns immediately; see runHistoryWorker for the incident that
+	// motivated this. The group-info cache is per run.
+	a.groups.reset()
+	a.historySkipped.Store(0)
+	enqueueHistory, stopHistory := a.runHistoryWorker(syncCtx, opts, &messagesStored, &lastEvent, enqueueMedia, limits)
+	defer stopHistory()
+
+	handlerID := a.addSyncEventHandler(syncCtx, opts, &messagesStored, &lastEvent, disconnected, enqueueMedia, enqueueWebhook, enqueueHistory, limits)
 	defer a.wa.RemoveEventHandler(handlerID)
 
 	if err := a.connectForSync(syncCtx, opts); err != nil {
@@ -313,121 +321,131 @@ func chatKind(chat types.JID) string {
 	return "unknown"
 }
 
-func (a *App) storeParsedMessage(ctx context.Context, pm wa.ParsedMessage) error {
-	pm.Chat = a.canonicalStoreJID(ctx, pm.Chat)
-	chatJID := canonicalJIDString(pm.Chat)
-	chatName := a.wa.ResolveChatName(ctx, pm.Chat, pm.PushName)
-	if pm.Chat != types.StatusBroadcastJID {
-		if err := a.db.UpsertChat(chatJID, chatKind(pm.Chat), chatName, pm.Timestamp); err != nil {
-			return err
-		}
-	}
+// contactRecord is a contacts-table upsert derived while resolving a sender or
+// DM peer. It is returned separately so the history path can dedupe it per
+// conversation instead of rewriting the row for every message.
+type contactRecord struct {
+	jid, phone, pushName, fullName, firstName, businessName string
+}
 
-	// Best-effort: store contact info for DMs.
-	if pm.Chat.Server == types.DefaultUserServer {
-		chat := canonicalJID(pm.Chat)
-		if info, err := a.wa.GetContact(ctx, chat); err == nil {
-			_ = a.db.UpsertContact(
-				chat.String(),
-				chat.User,
-				info.PushName,
-				info.FullName,
-				info.FirstName,
-				info.BusinessName,
-			)
-		}
+func contactRecordFrom(jid types.JID, info types.ContactInfo) contactRecord {
+	return contactRecord{
+		jid:          jid.String(),
+		phone:        jid.User,
+		pushName:     info.PushName,
+		fullName:     info.FullName,
+		firstName:    info.FirstName,
+		businessName: info.BusinessName,
 	}
+}
 
-	senderName := ""
+func (a *App) upsertContactRecord(db *store.DB, c contactRecord) {
+	_ = db.UpsertContact(c.jid, c.phone, c.pushName, c.fullName, c.firstName, c.businessName)
+}
+
+// dmContact returns the contact row for a DM peer, if the contact store knows
+// it. Contact lookups are local (whatsmeow contact store), not network.
+func (a *App) dmContact(ctx context.Context, chat types.JID) (contactRecord, bool) {
+	if chat.Server != types.DefaultUserServer {
+		return contactRecord{}, false
+	}
+	chat = canonicalJID(chat)
+	info, err := a.wa.GetContact(ctx, chat)
+	if err != nil {
+		return contactRecord{}, false
+	}
+	return contactRecordFrom(chat, info), true
+}
+
+// resolveSender canonicalises the sender JID and picks the display name,
+// returning the contact row to persist when the contact store knows the sender.
+func (a *App) resolveSender(ctx context.Context, pm wa.ParsedMessage) (senderJID, senderName string, contact *contactRecord) {
 	if pm.FromMe {
 		senderName = "me"
 	} else if s := strings.TrimSpace(pm.PushName); s != "" && s != "-" {
 		senderName = s
 	}
-	senderJID := pm.SenderJID
-	if pm.SenderJID != "" {
-		if jid, err := types.ParseJID(pm.SenderJID); err == nil {
-			contactJID := a.canonicalStoreJID(ctx, jid)
-			senderJID = contactJID.String()
-			if info, err := a.wa.GetContact(ctx, contactJID); err == nil {
-				if name := wa.BestContactName(info); name != "" {
-					senderName = name
-				}
-				_ = a.db.UpsertContact(
-					contactJID.String(),
-					contactJID.User,
-					info.PushName,
-					info.FullName,
-					info.FirstName,
-					info.BusinessName,
-				)
-			}
-		}
+	senderJID = pm.SenderJID
+	if pm.SenderJID == "" {
+		return senderJID, senderName, nil
 	}
-
-	// Best-effort: store group metadata (and participants) when available.
-	if pm.Chat.Server == types.GroupServer {
-		if gi, err := a.wa.GetGroupInfo(ctx, pm.Chat); err == nil && gi != nil {
-			_ = a.db.UpsertGroupWithHierarchy(gi.JID.String(), gi.GroupName.Name, gi.OwnerJID.String(), gi.GroupCreated, gi.IsParent, gi.LinkedParentJID.String())
-			var ps []store.GroupParticipant
-			for _, p := range gi.Participants {
-				role := "member"
-				if p.IsSuperAdmin {
-					role = "superadmin"
-				} else if p.IsAdmin {
-					role = "admin"
-				}
-				ps = append(ps, store.GroupParticipant{
-					GroupJID: pm.Chat.String(),
-					UserJID:  canonicalJIDString(p.JID),
-					Role:     role,
-				})
-			}
-			_ = a.db.ReplaceGroupParticipants(pm.Chat.String(), ps)
-		}
+	jid, err := types.ParseJID(pm.SenderJID)
+	if err != nil {
+		return senderJID, senderName, nil
 	}
+	contactJID := a.canonicalStoreJID(ctx, jid)
+	senderJID = contactJID.String()
+	info, err := a.wa.GetContact(ctx, contactJID)
+	if err != nil {
+		return senderJID, senderName, nil
+	}
+	if name := wa.BestContactName(info); name != "" {
+		senderName = name
+	}
+	rec := contactRecordFrom(contactJID, info)
+	return senderJID, senderName, &rec
+}
 
-	var mediaType, caption, filename, mimeType, directPath string
-	var mediaKey, fileSha, fileEncSha []byte
-	var fileLen uint64
+type mediaFields struct {
+	mediaType, caption, filename, mimeType, directPath string
+	mediaKey, fileSha, fileEncSha                      []byte
+	fileLen                                            uint64
+}
+
+func mediaFieldsOf(pm wa.ParsedMessage) mediaFields {
+	var m mediaFields
 	if pm.Media != nil {
-		mediaType = pm.Media.Type
-		caption = pm.Media.Caption
-		filename = pm.Media.Filename
-		mimeType = pm.Media.MimeType
-		directPath = pm.Media.DirectPath
-		mediaKey = pm.Media.MediaKey
-		fileSha = pm.Media.FileSHA256
-		fileEncSha = pm.Media.FileEncSHA256
-		fileLen = pm.Media.FileLength
+		m.mediaType = pm.Media.Type
+		m.caption = pm.Media.Caption
+		m.filename = pm.Media.Filename
+		m.mimeType = pm.Media.MimeType
+		m.directPath = pm.Media.DirectPath
+		m.mediaKey = pm.Media.MediaKey
+		m.fileSha = pm.Media.FileSHA256
+		m.fileEncSha = pm.Media.FileEncSHA256
+		m.fileLen = pm.Media.FileLength
 	}
+	return m
+}
 
-	if pm.Chat == types.StatusBroadcastJID {
-		return a.db.UpsertStatusMessage(store.UpsertStatusMessageParams{
-			MsgID:         pm.ID,
-			Timestamp:     pm.Timestamp,
-			FromMe:        pm.FromMe,
-			SenderJID:     senderJID,
-			SenderName:    senderName,
-			Text:          pm.Text,
-			MediaType:     mediaType,
-			MediaCaption:  caption,
-			Filename:      filename,
-			MimeType:      mimeType,
-			DirectPath:    directPath,
-			MediaKey:      mediaKey,
-			FileSHA256:    fileSha,
-			FileEncSHA256: fileEncSha,
-			FileLength:    fileLen,
-		})
+func buildStatusMessageParams(pm wa.ParsedMessage, senderJID, senderName string) store.UpsertStatusMessageParams {
+	m := mediaFieldsOf(pm)
+	return store.UpsertStatusMessageParams{
+		MsgID:         pm.ID,
+		Timestamp:     pm.Timestamp,
+		FromMe:        pm.FromMe,
+		SenderJID:     senderJID,
+		SenderName:    senderName,
+		Text:          pm.Text,
+		MediaType:     m.mediaType,
+		MediaCaption:  m.caption,
+		Filename:      m.filename,
+		MimeType:      m.mimeType,
+		DirectPath:    m.directPath,
+		MediaKey:      m.mediaKey,
+		FileSHA256:    m.fileSha,
+		FileEncSHA256: m.fileEncSha,
+		FileLength:    m.fileLen,
 	}
+}
 
-	displayText := a.buildDisplayText(ctx, pm)
+// finalDisplayText computes the display text for pm, reading quoted/reacted
+// messages through db (which may be a transaction-scoped store so rows written
+// earlier in the same transaction are visible).
+func (a *App) finalDisplayText(db *store.DB, pm wa.ParsedMessage) string {
 	if pm.Revoked {
-		displayText = store.DeletedMessageDisplayText
+		return store.DeletedMessageDisplayText
 	}
+	return a.buildDisplayTextWith(db, pm)
+}
 
-	if err := a.db.UpsertMessage(store.UpsertMessageParams{
+// buildUpsertMessageParams assembles the messages row for pm. pm.Chat must
+// already be canonical. DisplayText is left for the caller (finalDisplayText)
+// because it reads the quoted/reacted row and must see the store the write
+// goes to (the batch transaction in the history path).
+func buildUpsertMessageParams(pm wa.ParsedMessage, chatJID, chatName, senderJID, senderName string) store.UpsertMessageParams {
+	m := mediaFieldsOf(pm)
+	return store.UpsertMessageParams{
 		ChatJID:         chatJID,
 		ChatName:        chatName,
 		MsgID:           pm.ID,
@@ -436,7 +454,6 @@ func (a *App) storeParsedMessage(ctx context.Context, pm wa.ParsedMessage) error
 		Timestamp:       pm.Timestamp,
 		FromMe:          pm.FromMe,
 		Text:            pm.Text,
-		DisplayText:     displayText,
 		QuotedMsgID:     pm.ReplyToID,
 		QuotedSenderJID: pm.ReplyToSenderJID,
 		Buttons:         waButtonsToStore(pm.Buttons),
@@ -444,29 +461,33 @@ func (a *App) storeParsedMessage(ctx context.Context, pm wa.ParsedMessage) error
 		ForwardingScore: pm.ForwardingScore,
 		ReactionToID:    pm.ReactionToID,
 		ReactionEmoji:   pm.ReactionEmoji,
-		MediaType:       mediaType,
-		MediaCaption:    caption,
-		Filename:        filename,
-		MimeType:        mimeType,
-		DirectPath:      directPath,
-		MediaKey:        mediaKey,
-		FileSHA256:      fileSha,
-		FileEncSHA256:   fileEncSha,
-		FileLength:      fileLen,
+		MediaType:       m.mediaType,
+		MediaCaption:    m.caption,
+		Filename:        m.filename,
+		MimeType:        m.mimeType,
+		DirectPath:      m.directPath,
+		MediaKey:        m.mediaKey,
+		FileSHA256:      m.fileSha,
+		FileEncSHA256:   m.fileEncSha,
+		FileLength:      m.fileLen,
 		Edited:          pm.Edited,
 		Revoked:         pm.Revoked,
-	}); err != nil {
-		return err
 	}
+}
+
+// storeMessageExtras persists the per-message side rows (call event, starred
+// state) that accompany a stored message row.
+func (a *App) storeMessageExtras(ctx context.Context, pm wa.ParsedMessage, chatJID, chatName, senderJID, senderName string) error {
 	if pm.Call != nil {
-		pm.Call.Chat = pm.Chat
-		if pm.Call.SenderJID == "" {
-			pm.Call.SenderJID = senderJID
+		call := *pm.Call
+		call.Chat = pm.Chat
+		if call.SenderJID == "" {
+			call.SenderJID = senderJID
 		}
-		if pm.Call.Timestamp.IsZero() {
-			pm.Call.Timestamp = pm.Timestamp
+		if call.Timestamp.IsZero() {
+			call.Timestamp = pm.Timestamp
 		}
-		if err := a.storeParsedCallEvent(ctx, *pm.Call, chatName, senderName); err != nil {
+		if err := a.storeParsedCallEvent(ctx, call, chatName, senderName); err != nil {
 			return err
 		}
 	}
@@ -481,6 +502,41 @@ func (a *App) storeParsedMessage(ctx context.Context, pm wa.ParsedMessage) error
 		})
 	}
 	return nil
+}
+
+func (a *App) storeParsedMessage(ctx context.Context, pm wa.ParsedMessage) error {
+	pm.Chat = a.canonicalStoreJID(ctx, pm.Chat)
+	chatJID := canonicalJIDString(pm.Chat)
+	chatName := a.resolveChatName(ctx, pm.Chat, pm.PushName)
+	if pm.Chat != types.StatusBroadcastJID {
+		if err := a.db.UpsertChat(chatJID, chatKind(pm.Chat), chatName, pm.Timestamp); err != nil {
+			return err
+		}
+	}
+
+	// Best-effort: store contact info for DMs.
+	if rec, ok := a.dmContact(ctx, pm.Chat); ok {
+		a.upsertContactRecord(a.db, rec)
+	}
+
+	senderJID, senderName, contact := a.resolveSender(ctx, pm)
+	if contact != nil {
+		a.upsertContactRecord(a.db, *contact)
+	}
+
+	// Best-effort: store group metadata (and participants) when available.
+	a.ensureGroupStored(ctx, pm.Chat)
+
+	if pm.Chat == types.StatusBroadcastJID {
+		return a.db.UpsertStatusMessage(buildStatusMessageParams(pm, senderJID, senderName))
+	}
+
+	params := buildUpsertMessageParams(pm, chatJID, chatName, senderJID, senderName)
+	params.DisplayText = a.finalDisplayText(a.db, pm)
+	if err := a.db.UpsertMessage(params); err != nil {
+		return err
+	}
+	return a.storeMessageExtras(ctx, pm, chatJID, chatName, senderJID, senderName)
 }
 
 func (a *App) storeParsedCallEvent(ctx context.Context, call wa.ParsedCallEvent, chatName, senderName string) error {
@@ -578,14 +634,16 @@ func waButtonsToStore(buttons []wa.Button) []store.Button {
 	return out
 }
 
-func (a *App) buildDisplayText(ctx context.Context, pm wa.ParsedMessage) string {
+// buildDisplayTextWith renders the display text for pm, reading quoted/reacted
+// messages through db (which may be transaction-scoped).
+func (a *App) buildDisplayTextWith(db *store.DB, pm wa.ParsedMessage) string {
 	base := baseDisplayText(pm)
 
 	if pm.ReactionToID != "" || strings.TrimSpace(pm.ReactionEmoji) != "" {
 		target := strings.TrimSpace(pm.ReactionToID)
 		display := ""
 		if target != "" {
-			display = a.lookupMessageDisplayText(pm.Chat.String(), target)
+			display = a.lookupMessageDisplayTextIn(db, pm.Chat.String(), target)
 		}
 		if display == "" {
 			display = "message"
@@ -600,7 +658,7 @@ func (a *App) buildDisplayText(ctx context.Context, pm wa.ParsedMessage) string 
 	if pm.ReplyToID != "" {
 		quoted := strings.TrimSpace(pm.ReplyToDisplay)
 		if quoted == "" {
-			quoted = a.lookupMessageDisplayText(pm.Chat.String(), pm.ReplyToID)
+			quoted = a.lookupMessageDisplayTextIn(db, pm.Chat.String(), pm.ReplyToID)
 		}
 		if quoted == "" {
 			quoted = "message"
@@ -662,11 +720,11 @@ func formatCallDuration(seconds int64) string {
 	return fmt.Sprintf("%dm%02ds", minutes, secs)
 }
 
-func (a *App) lookupMessageDisplayText(chatJID, msgID string) string {
+func (a *App) lookupMessageDisplayTextIn(db *store.DB, chatJID, msgID string) string {
 	if strings.TrimSpace(chatJID) == "" || strings.TrimSpace(msgID) == "" {
 		return ""
 	}
-	msg, err := a.db.GetMessage(chatJID, msgID)
+	msg, err := db.GetMessage(chatJID, msgID)
 	if err != nil {
 		return ""
 	}

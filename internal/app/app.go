@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/openclaw/wacli/internal/fsutil"
@@ -109,6 +110,8 @@ type App struct {
 	wa              WAClient
 	sessionResolver *readOnlySessionResolver
 	db              *store.DB
+	groups          *groupInfoCache
+	historySkipped  atomic.Int64 // history messages skipped as already stored (per Sync run)
 	statusMu        sync.Mutex
 	status          *syncStatus
 }
@@ -136,7 +139,7 @@ func New(opts Options) (*App, error) {
 		return nil, err
 	}
 
-	return &App{opts: opts, db: db}, nil
+	return &App{opts: opts, db: db, groups: newGroupInfoCache(groupInfoCacheTTL, groupInfoCacheErrTTL)}, nil
 }
 
 func (a *App) OpenWA() error {

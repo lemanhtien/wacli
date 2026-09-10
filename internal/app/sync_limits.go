@@ -33,6 +33,22 @@ func (l *syncStorageLimits) StoreParsedMessage(ctx context.Context, pm wa.Parsed
 	return nil
 }
 
+// enabled reports whether any storage cap is configured.
+func (l *syncStorageLimits) enabled() bool {
+	return l != nil && (l.opts.MaxMessages > 0 || l.opts.MaxDBSizeBytes > 0)
+}
+
+// check re-evaluates the caps, records (and latches) a breach, and returns it.
+// It is a no-op when no cap is configured.
+func (l *syncStorageLimits) check() error {
+	if !l.enabled() {
+		return nil
+	}
+	err := l.app.checkSyncStorageLimits(l.opts)
+	l.setErr(err)
+	return err
+}
+
 func (l *syncStorageLimits) Err() error {
 	if l == nil {
 		return nil

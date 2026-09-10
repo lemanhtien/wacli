@@ -64,6 +64,8 @@ type fakeWA struct {
 	markReadCalls               []fakeMarkReadCall
 
 	manualHistorySyncCalls []bool
+	groupInfoCalls         int
+	groupInfoErr           error
 	appStateRecoveries     []string
 	appStateFetches        []fakeAppStateFetch
 }
@@ -301,6 +303,10 @@ func (f *fakeWA) GetJoinedGroups(ctx context.Context) ([]*types.GroupInfo, error
 func (f *fakeWA) GetGroupInfo(ctx context.Context, jid types.JID) (*types.GroupInfo, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.groupInfoCalls++
+	if f.groupInfoErr != nil {
+		return nil, f.groupInfoErr
+	}
 	return f.groups[jid], nil
 }
 

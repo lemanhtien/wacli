@@ -33,7 +33,7 @@ func newMediaEnqueuer(ctx context.Context, jobs chan<- mediaJob) func(chatJID, m
 	}
 }
 
-func (a *App) addSyncEventHandler(ctx context.Context, opts SyncOptions, messagesStored, lastEvent *atomic.Int64, disconnected chan<- struct{}, enqueueMedia func(string, string), enqueueWebhook func(wa.ParsedMessage), limits *syncStorageLimits) uint32 {
+func (a *App) addSyncEventHandler(ctx context.Context, opts SyncOptions, messagesStored, lastEvent *atomic.Int64, disconnected chan<- struct{}, enqueueMedia func(string, string), enqueueWebhook func(wa.ParsedMessage), enqueueHistory func(historyJob), limits *syncStorageLimits) uint32 {
 	var panicCount atomic.Int64
 	var appStateRecoveries sync.Map
 	return a.wa.AddEventHandler(func(evt interface{}) {
@@ -62,7 +62,11 @@ func (a *App) addSyncEventHandler(ctx context.Context, opts SyncOptions, message
 				if notif.GetSyncType() == waE2E.HistorySyncType_ON_DEMAND {
 					return
 				}
-				a.downloadAndHandleHistorySync(ctx, opts, notif, messagesStored, lastEvent, enqueueMedia, limits)
+				// Never download or replay a chunk inside the node handler:
+				// whatsmeow serialises node handling, so anything slow here
+				// stalls (and, after ~5 min, loses) the realtime messages
+				// queued behind it. The history worker owns the chunk.
+				enqueueHistory(historyJob{notif: notif})
 				return
 			}
 			a.handleLiveSyncMessage(ctx, opts, v, messagesStored, enqueueMedia, enqueueWebhook, limits)
@@ -73,7 +77,7 @@ func (a *App) addSyncEventHandler(ctx context.Context, opts SyncOptions, message
 			a.handleLiveCallEvent(ctx, v)
 		case *events.HistorySync:
 			lastEvent.Store(nowUTC().UnixNano())
-			a.handleHistorySync(ctx, opts, v, messagesStored, lastEvent, enqueueMedia, limits)
+			enqueueHistory(historyJob{evt: v})
 		case *events.Star:
 			lastEvent.Store(nowUTC().UnixNano())
 			a.handleStarEvent(ctx, v)
@@ -271,7 +275,19 @@ func (a *App) handleLiveSyncMessage(ctx context.Context, opts SyncOptions, v *ev
 		a.decryptEncryptedReaction(ctx, &pm, v)
 	}
 	incrementUnread := a.shouldIncrementLiveUnread(ctx, pm)
-	if err := a.storeParsedMessageForSync(ctx, pm, limits...); err == nil {
+	attempts, err := retryOnBusy(ctx, liveStoreRetryDelays, func() error {
+		return a.storeParsedMessageForSync(ctx, pm, limits...)
+	})
+	if err != nil {
+		// A realtime message that fails to store is gone for good (the server
+		// will not resend it), so never fail silently.
+		chatJID := canonicalJIDString(a.canonicalStoreJID(ctx, pm.Chat))
+		a.emitWarning(
+			"live_store_failed",
+			fmt.Sprintf("warning: failed to store live message %s in chat %s after %d attempt(s): %v", pm.ID, chatJID, attempts, err),
+			map[string]any{"chat_jid": chatJID, "message_id": pm.ID, "attempts": attempts, "error": err.Error()},
+		)
+	} else {
 		if incrementUnread {
 			a.incrementLiveUnread(ctx, pm)
 		}
@@ -291,7 +307,10 @@ func (a *App) handleLiveSyncMessage(ctx context.Context, opts SyncOptions, v *ev
 }
 
 func (a *App) downloadAndHandleHistorySync(ctx context.Context, opts SyncOptions, notif *waE2E.HistorySyncNotification, messagesStored, lastEvent *atomic.Int64, enqueueMedia func(string, string), limits ...*syncStorageLimits) {
+	stopKeepAlive := keepLastEventAlive(lastEvent, 5*time.Second)
 	data, err := a.wa.DownloadHistorySync(ctx, notif)
+	stopKeepAlive()
+	lastEvent.Store(nowUTC().UnixNano())
 	if err != nil {
 		a.emitWarning(
 			"history_download_failed",
@@ -317,65 +336,68 @@ func historySyncNotificationFromMessage(v *events.Message) *waE2E.HistorySyncNot
 	return v.Message.GetProtocolMessage().GetHistorySyncNotification()
 }
 
+// liveStoreRetryDelays is the backoff used when a realtime store hits SQLite
+// lock contention (e.g. a history batch commit in progress).
+var liveStoreRetryDelays = []time.Duration{200 * time.Millisecond, 800 * time.Millisecond, 2 * time.Second}
+
+// retryOnBusy runs fn, retrying after each delay in delays while the error is
+// a transient SQLite busy/locked error. Any other error (or success) returns
+// immediately. It reports the number of attempts made.
+func retryOnBusy(ctx context.Context, delays []time.Duration, fn func() error) (attempts int, err error) {
+	for i := 0; ; i++ {
+		attempts = i + 1
+		err = fn()
+		if err == nil || i >= len(delays) || !store.IsBusyError(err) {
+			return attempts, err
+		}
+		timer := time.NewTimer(delays[i])
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			timer.Stop()
+			return attempts, err
+		}
+	}
+}
+
 func (a *App) handleHistorySync(ctx context.Context, opts SyncOptions, v *events.HistorySync, messagesStored, lastEvent *atomic.Int64, enqueueMedia func(string, string), limits ...*syncStorageLimits) {
+	var lim *syncStorageLimits
+	if len(limits) > 0 {
+		lim = limits[0]
+	}
 	a.emitOrPrint("history_sync", map[string]any{"conversations": len(v.Data.Conversations)}, "\nProcessing history sync (%d conversations)...\n", len(v.Data.Conversations))
 	a.storeHistoryCallLogRecords(ctx, v, lastEvent)
-	for _, conv := range v.Data.Conversations {
+	var skipped int64
+	aborted := false
+	for i, conv := range v.Data.Conversations {
 		lastEvent.Store(nowUTC().UnixNano())
 		chatID := strings.TrimSpace(conv.GetID())
 		if chatID == "" {
 			continue
 		}
+		// Shutdown: finish the conversation in progress, do not start the next.
+		if i > 0 && ctx.Err() != nil {
+			aborted = true
+			break
+		}
 		a.storeHistoryUnreadCount(ctx, chatID, conv)
-		var pendingPolls []historyPollSideEffect
-		for _, m := range conv.Messages {
-			lastEvent.Store(nowUTC().UnixNano())
-			if m.Message == nil {
-				continue
-			}
-			pm := wa.ParseHistoryMessage(chatID, m.Message)
-			if pm.ID == "" || pm.Chat.IsEmpty() {
-				continue
-			}
-			var pollEvt *events.Message
-			if normalized, evt, ok := a.normalizeHistoryPollMessage(pm, m.Message); ok {
-				pm = normalized
-				pollEvt = evt
-			}
-			if pm.ReactionToID != "" && pm.ReactionEmoji == "" && m.Message.GetMessage().GetEncReactionMessage() != nil {
-				evt, err := a.wa.ParseWebMessage(pm.Chat, m.Message)
-				if err != nil {
-					a.emitWarning(
-						"encrypted_reaction_parse_failed",
-						fmt.Sprintf("warning: failed to parse encrypted reaction message %s: %v", pm.ID, err),
-						map[string]any{"message_id": pm.ID, "error": err.Error()},
-					)
-				} else {
-					a.decryptEncryptedReaction(ctx, &pm, evt)
-				}
-			}
-			if err := a.storeParsedMessageForSync(ctx, pm, limits...); err == nil {
-				a.emitSyncProgress(messagesStored.Add(1))
-				if pm.Poll != nil || pm.PollAdd != nil || pm.PollVote != nil {
-					pendingPolls = append(pendingPolls, historyPollSideEffect{pm: pm, evt: pollEvt, hist: m.Message})
-				}
-			} else if ctx.Err() != nil {
-				a.handleHistoryPollSideEffectsBatch(context.WithoutCancel(ctx), pendingPolls)
-				return
-			}
-			if opts.DownloadMedia && pm.Media != nil && pm.ID != "" {
-				enqueueMedia(canonicalJIDString(a.canonicalStoreJID(ctx, pm.Chat)), pm.ID)
-			}
+		res := a.storeHistoryConversation(ctx, opts, chatID, conv, messagesStored, lastEvent, enqueueMedia, lim)
+		skipped += res.skipped
+		if res.aborted {
+			aborted = true
+			break
 		}
-		flushCtx := ctx
-		if ctx.Err() != nil {
-			flushCtx = context.WithoutCancel(ctx)
-		}
-		a.handleHistoryPollSideEffectsBatch(flushCtx, pendingPolls)
 	}
-	if !a.eventsEnabled() {
-		a.emitOrPrint("progress", map[string]any{"messages_synced": messagesStored.Load()}, "\rSynced %d messages...", messagesStored.Load())
+	totalSkipped := a.historySkipped.Add(skipped)
+	if aborted {
+		return
 	}
+	// One progress heartbeat per chunk (in every output mode) so the caller
+	// can see replay advancing even when every message was already stored.
+	a.emitOrPrint("progress", map[string]any{
+		"messages_synced":  messagesStored.Load(),
+		"messages_skipped": totalSkipped,
+	}, "\rSynced %d messages (%d already stored)...", messagesStored.Load(), totalSkipped)
 }
 
 func (a *App) storeHistoryCallLogRecords(ctx context.Context, v *events.HistorySync, lastEvent *atomic.Int64) {
