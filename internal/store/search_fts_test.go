@@ -274,3 +274,200 @@ func TestFTSCodePrefixSearch(t *testing.T) {
 		t.Errorf("query hello: want no prefix match on helloworld, got %v", got)
 	}
 }
+
+// ftsColumns returns the raw values stored in messages_fts for one message.
+func ftsColumns(t *testing.T, db *DB, msgID string) (text, caption, display string) {
+	t.Helper()
+	err := db.sql.QueryRow(`
+		SELECT f.text, f.media_caption, f.display_text
+		FROM messages_fts f JOIN messages m ON m.rowid = f.rowid
+		WHERE m.msg_id = ?`, msgID).Scan(&text, &caption, &display)
+	if err != nil {
+		t.Fatalf("fts row for %s: %v", msgID, err)
+	}
+	return text, caption, display
+}
+
+// TestFTSSkipsDuplicateColumns verifies that a column which only repeats the
+// message body (display_text == text, media_caption == text) is not indexed a
+// second time, while search still finds the message and distinct values are
+// still indexed.
+func TestFTSSkipsDuplicateColumns(t *testing.T) {
+	db := openTestDB(t)
+	if !db.HasFTS() {
+		t.Skip("FTS5 not enabled")
+	}
+	base := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+	chat := "123@g.us"
+	if err := db.UpsertChat(chat, "group", "Watches", base); err != nil {
+		t.Fatalf("UpsertChat: %v", err)
+	}
+	upsert := func(p UpsertMessageParams) {
+		t.Helper()
+		p.ChatJID = chat
+		p.SenderJID = "111@s.whatsapp.net"
+		if p.Timestamp.IsZero() {
+			p.Timestamp = base
+		}
+		if err := db.UpsertMessage(p); err != nil {
+			t.Fatalf("UpsertMessage %s: %v", p.MsgID, err)
+		}
+	}
+	search := func(q string) []string {
+		t.Helper()
+		msgs, err := db.SearchMessages(SearchMessagesParams{Query: q, Limit: 10})
+		if err != nil {
+			t.Fatalf("SearchMessages(%q): %v", q, err)
+		}
+		ids := make([]string, 0, len(msgs))
+		for _, m := range msgs {
+			ids = append(ids, m.MsgID)
+		}
+		return ids
+	}
+
+	// Plain text: display_text repeats text.
+	upsert(UpsertMessageParams{MsgID: "plain", Text: "rolex submariner", DisplayText: "rolex submariner"})
+	// Captioned image: text repeats media_caption, display_text is a label.
+	upsert(UpsertMessageParams{MsgID: "img", Text: "patek nautilus", MediaType: "image", MediaCaption: "patek nautilus", DisplayText: "Sent image"})
+	// Reply: display_text carries extra context and must stay searchable.
+	upsert(UpsertMessageParams{MsgID: "reply", Text: "deal", DisplayText: "> quotedneedle\ndeal"})
+	// No text at all: display_text repeats the caption.
+	upsert(UpsertMessageParams{MsgID: "caponly", MediaType: "video", MediaCaption: "omega speedmaster", DisplayText: "omega speedmaster"})
+
+	if text, caption, display := ftsColumns(t, db, "plain"); text != "rolex submariner" || caption != "" || display != "" {
+		t.Fatalf("plain fts = (%q,%q,%q), want text only", text, caption, display)
+	}
+	if text, caption, display := ftsColumns(t, db, "img"); text != "patek nautilus" || caption != "" || display != "Sent image" {
+		t.Fatalf("img fts = (%q,%q,%q)", text, caption, display)
+	}
+	if _, _, display := ftsColumns(t, db, "reply"); display != "> quotedneedle\ndeal" {
+		t.Fatalf("reply display_text not indexed: %q", display)
+	}
+	if text, caption, display := ftsColumns(t, db, "caponly"); text != "" || caption != "omega speedmaster" || display != "" {
+		t.Fatalf("caponly fts = (%q,%q,%q), want caption only", text, caption, display)
+	}
+
+	for q, want := range map[string]string{
+		"submariner":   "plain",
+		"nautilus":     "img",
+		"quotedneedle": "reply",
+		"speedmaster":  "caponly",
+	} {
+		if got := search(q); len(got) != 1 || got[0] != want {
+			t.Fatalf("search %q = %v, want [%s]", q, got, want)
+		}
+	}
+
+	// Update path (messages_au): re-upserting keeps exactly one FTS row.
+	upsert(UpsertMessageParams{MsgID: "plain", Text: "rolex submariner", DisplayText: "rolex submariner", ChatName: "Watches"})
+	if got := search("submariner"); len(got) != 1 {
+		t.Fatalf("after update search = %v, want one row", got)
+	}
+	// Delete path (messages_ad).
+	if _, err := db.sql.Exec(`DELETE FROM messages WHERE msg_id = 'plain'`); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	if got := search("submariner"); len(got) != 0 {
+		t.Fatalf("after delete search = %v, want none", got)
+	}
+	if n := countRows(t, db.sql, `SELECT count(*) FROM messages_fts`); n != 3 {
+		t.Fatalf("messages_fts rows = %d, want 3", n)
+	}
+}
+
+// TestFTSDedupTriggerMigrationUpgradesExistingStore simulates a store created
+// before migration 21: old triggers, rows indexed with duplicated columns. The
+// migration must swap the triggers, and deleting/updating old rows must still
+// keep messages_fts consistent.
+func TestFTSDedupTriggerMigrationUpgradesExistingStore(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "wacli.db")
+	db, err := Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if !db.HasFTS() {
+		_ = db.Close()
+		t.Skip("FTS5 not enabled")
+	}
+	base := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+	chat := "123@g.us"
+	if err := db.UpsertChat(chat, "group", "Watches", base); err != nil {
+		t.Fatalf("UpsertChat: %v", err)
+	}
+	// Roll the store back to the pre-21 triggers.
+	if _, err := db.sql.Exec(`
+		DROP TRIGGER messages_ai; DROP TRIGGER messages_ad; DROP TRIGGER messages_au;
+		CREATE TRIGGER messages_ai AFTER INSERT ON messages WHEN new.revoked = 0 AND new.deleted_for_me = 0 BEGIN
+			INSERT INTO messages_fts(rowid, text, media_caption, filename, chat_name, sender_name, display_text)
+			VALUES (new.rowid, COALESCE(new.text,''), COALESCE(new.media_caption,''), COALESCE(new.filename,''), COALESCE(new.chat_name,''), COALESCE(new.sender_name,''), COALESCE(new.display_text,''));
+		END;
+		CREATE TRIGGER messages_ad AFTER DELETE ON messages BEGIN
+			DELETE FROM messages_fts WHERE rowid = old.rowid;
+		END;
+		CREATE TRIGGER messages_au AFTER UPDATE ON messages BEGIN
+			DELETE FROM messages_fts WHERE rowid = old.rowid;
+			INSERT INTO messages_fts(rowid, text, media_caption, filename, chat_name, sender_name, display_text)
+			SELECT new.rowid, COALESCE(new.text,''), COALESCE(new.media_caption,''), COALESCE(new.filename,''), COALESCE(new.chat_name,''), COALESCE(new.sender_name,''), COALESCE(new.display_text,'')
+			WHERE new.revoked = 0 AND new.deleted_for_me = 0;
+		END;
+		DELETE FROM schema_migrations WHERE version = 21;
+	`); err != nil {
+		t.Fatalf("install old triggers: %v", err)
+	}
+	old := UpsertMessageParams{ChatJID: chat, MsgID: "old", SenderJID: "1@s.whatsapp.net", Timestamp: base, Text: "legacy daytona", DisplayText: "legacy daytona"}
+	if err := db.UpsertMessage(old); err != nil {
+		t.Fatalf("UpsertMessage old: %v", err)
+	}
+	if _, _, display := ftsColumns(t, db, "old"); display != "legacy daytona" {
+		t.Fatalf("precondition: old trigger should duplicate display_text, got %q", display)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	db, err = Open(path)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer db.Close()
+	if n := countRows(t, db.sql, `SELECT count(*) FROM schema_migrations WHERE version = 21`); n != 1 {
+		t.Fatalf("migration 21 not recorded")
+	}
+	if n := countRows(t, db.sql, `SELECT count(*) FROM sqlite_master WHERE type = 'trigger' AND name IN ('messages_ai','messages_au') AND sql LIKE '%NULLIF(new.display_text, new.text)%'`); n != 2 {
+		t.Fatalf("de-duplicating triggers installed = %d, want 2", n)
+	}
+
+	// Old row is untouched by the migration and still searchable.
+	if _, _, display := ftsColumns(t, db, "old"); display != "legacy daytona" {
+		t.Fatalf("old row display_text changed by migration: %q", display)
+	}
+	// New row is de-duplicated.
+	if err := db.UpsertMessage(UpsertMessageParams{ChatJID: chat, MsgID: "new", SenderJID: "1@s.whatsapp.net", Timestamp: base, Text: "fresh daytona", DisplayText: "fresh daytona"}); err != nil {
+		t.Fatalf("UpsertMessage new: %v", err)
+	}
+	if _, _, display := ftsColumns(t, db, "new"); display != "" {
+		t.Fatalf("new row display_text = %q, want empty", display)
+	}
+	msgs, err := db.SearchMessages(SearchMessagesParams{Query: "daytona", Limit: 10})
+	if err != nil || len(msgs) != 2 {
+		t.Fatalf("search daytona = %d rows, err=%v, want 2", len(msgs), err)
+	}
+	// Updating then deleting an old-generation row leaves no stale index entry.
+	if err := db.UpsertMessage(old); err != nil {
+		t.Fatalf("re-upsert old: %v", err)
+	}
+	if _, err := db.sql.Exec(`DELETE FROM messages WHERE msg_id = 'old'`); err != nil {
+		t.Fatalf("delete old: %v", err)
+	}
+	msgs, err = db.SearchMessages(SearchMessagesParams{Query: "legacy", Limit: 10})
+	if err != nil || len(msgs) != 0 {
+		t.Fatalf("search legacy after delete = %d rows, err=%v, want 0", len(msgs), err)
+	}
+	if n := countRows(t, db.sql, `SELECT count(*) FROM messages_fts`); n != 1 {
+		t.Fatalf("messages_fts rows = %d, want 1", n)
+	}
+	if _, err := db.sql.Exec(`INSERT INTO messages_fts(messages_fts) VALUES('integrity-check')`); err != nil {
+		t.Fatalf("fts integrity-check: %v", err)
+	}
+}

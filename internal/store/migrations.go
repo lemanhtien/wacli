@@ -34,6 +34,7 @@ var schemaMigrations = []migration{
 	{version: 18, name: "chat unread count column", up: migrateChatUnreadCountColumn},
 	{version: 19, name: "messages quoted columns", up: migrateMessagesQuotedColumns},
 	{version: 20, name: "messages @lid partial indexes", up: migrateMessagesLIDPartialIndexes},
+	{version: 21, name: "messages fts skip duplicate columns", up: migrateMessagesFTSDedupTriggers},
 }
 
 func (d *DB) ensureSchema() error {
@@ -537,27 +538,7 @@ func migrateMessagesFTS(d *DB) error {
 	}
 
 	// Ensure triggers match expected semantics.
-	if _, err := d.sql.Exec(`
-		DROP TRIGGER IF EXISTS messages_ai;
-		DROP TRIGGER IF EXISTS messages_ad;
-		DROP TRIGGER IF EXISTS messages_au;
-
-		CREATE TRIGGER messages_ai AFTER INSERT ON messages WHEN new.revoked = 0 AND new.deleted_for_me = 0 BEGIN
-			INSERT INTO messages_fts(rowid, text, media_caption, filename, chat_name, sender_name, display_text)
-			VALUES (new.rowid, COALESCE(new.text,''), COALESCE(new.media_caption,''), COALESCE(new.filename,''), COALESCE(new.chat_name,''), COALESCE(new.sender_name,''), COALESCE(new.display_text,''));
-		END;
-
-		CREATE TRIGGER messages_ad AFTER DELETE ON messages BEGIN
-			DELETE FROM messages_fts WHERE rowid = old.rowid;
-		END;
-
-		CREATE TRIGGER messages_au AFTER UPDATE ON messages BEGIN
-			DELETE FROM messages_fts WHERE rowid = old.rowid;
-			INSERT INTO messages_fts(rowid, text, media_caption, filename, chat_name, sender_name, display_text)
-			SELECT new.rowid, COALESCE(new.text,''), COALESCE(new.media_caption,''), COALESCE(new.filename,''), COALESCE(new.chat_name,''), COALESCE(new.sender_name,''), COALESCE(new.display_text,'')
-			WHERE new.revoked = 0 AND new.deleted_for_me = 0;
-		END;
-	`); err != nil {
+	if err := d.replaceMessagesFTSTriggers(); err != nil {
 		d.ftsEnabled = false
 		return nil
 	}
@@ -567,11 +548,11 @@ func migrateMessagesFTS(d *DB) error {
 			INSERT INTO messages_fts(rowid, text, media_caption, filename, chat_name, sender_name, display_text)
 			SELECT rowid,
 			       COALESCE(text,''),
-			       COALESCE(media_caption,''),
+			       COALESCE(NULLIF(media_caption, text),''),
 			       COALESCE(filename,''),
 			       COALESCE(chat_name,''),
 			       COALESCE(sender_name,''),
-			       COALESCE(display_text,'')
+			       COALESCE(NULLIF(NULLIF(display_text, text), media_caption),'')
 			FROM messages
 			WHERE revoked = 0 AND deleted_for_me = 0
 		`); err != nil {
@@ -594,6 +575,82 @@ func migrateMessagesFTS(d *DB) error {
 // SQLite answers the probe with a covering scan of the small index instead of
 // the whole table. Building them is a one-time full scan; every open after is
 // O(@lid rows).
+// messagesFTSTriggersSQL (re)creates the triggers that mirror messages into
+// messages_fts.
+//
+// messages_fts is a regular (not external-content) FTS5 table, so every column
+// value is both tokenised into the index and stored again verbatim in
+// messages_fts_content. For a plain text message display_text == text, and for
+// a captioned image/video text == media_caption, so the same body used to be
+// indexed and stored twice. On the production store (watch-trading groups,
+// ~3.9K chars per text message, ~300k messages/day) that doubled the FTS
+// footprint. A column that only repeats `text` (or, for display_text, the
+// caption) is now indexed as ” instead.
+//
+// Search results do not change: searchFTS runs an unqualified MATCH (any
+// column) and takes its snippet from column 0 (`text`), which is never blanked.
+// Rows indexed by the old triggers stay as they are; the delete trigger removes
+// by rowid, so both generations are cleaned up correctly.
+const messagesFTSTriggersSQL = `
+	DROP TRIGGER IF EXISTS messages_ai;
+	DROP TRIGGER IF EXISTS messages_ad;
+	DROP TRIGGER IF EXISTS messages_au;
+
+	CREATE TRIGGER messages_ai AFTER INSERT ON messages WHEN new.revoked = 0 AND new.deleted_for_me = 0 BEGIN
+		INSERT INTO messages_fts(rowid, text, media_caption, filename, chat_name, sender_name, display_text)
+		VALUES (new.rowid, COALESCE(new.text,''), COALESCE(NULLIF(new.media_caption, new.text),''), COALESCE(new.filename,''), COALESCE(new.chat_name,''), COALESCE(new.sender_name,''), COALESCE(NULLIF(NULLIF(new.display_text, new.text), new.media_caption),''));
+	END;
+
+	CREATE TRIGGER messages_ad AFTER DELETE ON messages BEGIN
+		DELETE FROM messages_fts WHERE rowid = old.rowid;
+	END;
+
+	CREATE TRIGGER messages_au AFTER UPDATE ON messages BEGIN
+		DELETE FROM messages_fts WHERE rowid = old.rowid;
+		INSERT INTO messages_fts(rowid, text, media_caption, filename, chat_name, sender_name, display_text)
+		SELECT new.rowid, COALESCE(new.text,''), COALESCE(NULLIF(new.media_caption, new.text),''), COALESCE(new.filename,''), COALESCE(new.chat_name,''), COALESCE(new.sender_name,''), COALESCE(NULLIF(NULLIF(new.display_text, new.text), new.media_caption),'')
+		WHERE new.revoked = 0 AND new.deleted_for_me = 0;
+	END;
+`
+
+// migrateMessagesFTSDedupTriggers swaps the FTS triggers of an existing store
+// for the de-duplicating ones (see messagesFTSTriggersSQL). It only rewrites
+// three triggers, so it is instant even on a 100GB store; already-indexed rows
+// are left alone and age out with normal retention.
+func migrateMessagesFTSDedupTriggers(d *DB) error {
+	exists, err := d.tableExists("messages_fts")
+	if err != nil {
+		return err
+	}
+	if !exists {
+		// Built without sqlite_fts5 (LIKE fallback): nothing to rewire.
+		return nil
+	}
+	if err := d.replaceMessagesFTSTriggers(); err != nil {
+		return fmt.Errorf("recreate messages fts triggers: %w", err)
+	}
+	return nil
+}
+
+// replaceMessagesFTSTriggers swaps the three FTS triggers in ONE transaction.
+// Other processes write to a live store while it is being opened (search and
+// the prune job do not take the store lock), so dropping the triggers outside
+// a transaction would let a message be inserted, updated or deleted with no
+// trigger in place and leave messages_fts permanently out of step. Inside the
+// transaction the write lock is held from the first DROP until COMMIT, and a
+// failure rolls back to the old triggers.
+func (d *DB) replaceMessagesFTSTriggers() error {
+	tx, err := d.sql.Begin()
+	if err != nil {
+		return err
+	}
+	if _, err := tx.Exec(messagesFTSTriggersSQL); err != nil {
+		_ = tx.Rollback()
+		return err
+	}
+	return tx.Commit()
+}
+
 func migrateMessagesLIDPartialIndexes(d *DB) error {
 	exists, err := d.tableExists("messages")
 	if err != nil {
