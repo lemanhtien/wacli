@@ -123,15 +123,20 @@ func TestSanitizeFTSQuery(t *testing.T) {
 		{"col:value", `"col:value"`},
 		// Prefix wildcard is neutralised.
 		{"test*", `"test*"`},
-		// Code-like tokens (digit + >= 4 runes) become prefix queries.
+		// Code-like tokens (letters/digits only, has a digit, >= 6 runes)
+		// become prefix queries.
 		{"228345", `"228345"*`},
-		{"ab12", `"ab12"*`},
+		{"15500st", `"15500st"*`},
 		{"đơn 228345", `"đơn" "228345"*`},
-		{"228345*", `"228345*"*`},
-		{`12"34`, `"12""34"*`},
+		// Tokens the tokenizer would split stay exact: a trailing `*` would
+		// apply to the last sub-token only ("5711/1" -> "1*").
+		{"5711/1", `"5711/1"`},
+		{"228345-A", `"228345-A"`},
+		{"228345*", `"228345*"`},
+		{`228345"`, `"228345"""`},
 		// Short or digit-free tokens stay exact.
-		{"123", `"123"`},
-		{"nguyen", `"nguyen"`},
+		{"12345", `"12345"`},
+		{"nguyenvan", `"nguyenvan"`},
 		// NEAR operator is neutralised.
 		{"NEAR(a b)", `"NEAR(a" "b)"`},
 		// Embedded double-quotes are escaped by doubling.

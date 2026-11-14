@@ -101,24 +101,44 @@ func sanitizeFTSQuery(q string) string {
 }
 
 // minPrefixSearchLen is the shortest token that is searched as a prefix.
-// Todo(@Tien): 4 is a guess — only benchmarked on a 46k-message local store
-// (~0.03s). Check search-queries.log on the 29GB prod store for short numeric
-// prefixes like "2025" / "1000"; raise the limit if they get slow.
-const minPrefixSearchLen = 4
+// Measured on the ~40GB production store (watch-trading chats, dense with
+// numeric refs): 4-5 char prefixes fan out to millions of rows ("1265*" ->
+// 2.1M rows, 32s warm; "12633*" -> 1.4M, 9s; "2026*" -> 4.4M, 4s), while
+// 6-char ones stayed at 0.1-2.5s warm ("228345*" 0.05s; worst seen
+// "126710*" 4.5s).
+// Todo(@Tien): 6 is from one spot-check of ~16 tokens on prod, mostly warm
+// cache; watch search-queries.log for slow 6+ char numeric queries.
+const minPrefixSearchLen = 6
 
-// isPrefixSearchToken reports whether tok should be matched as a prefix:
-// it must contain a digit (order numbers, codes, phone fragments) and be at
-// least minPrefixSearchLen runes long. Plain words keep exact-term matching on
-// purpose: FTS5 without a prefix index evaluates "abc*" by merging the doclists
-// of every indexed term starting with "abc" before the first row is returned,
-// so a common word prefix (e.g. "nguy*" -> nguyen, nguyet, ...) on a multi-GB
-// store would undo the rowid-order early termination in searchFTS. Terms that
-// start with a 4+ char digit-bearing prefix are rare, so that merge stays small.
+// isPrefixSearchToken reports whether tok should be matched as a prefix: it
+// must be at least minPrefixSearchLen runes, contain a digit (order numbers,
+// product refs), and consist only of letters and digits.
+//
+// The letters/digits rule matters: the unicode61 tokenizer splits on anything
+// else, and FTS5 applies a trailing `*` to the LAST sub-token only. So
+// "5711/1" would become the phrase "5711" + "1*", and "1*" merges every term
+// starting with "1" (379s measured on prod). Alphanumeric-only means the token
+// is exactly one indexed term.
+//
+// Plain words keep exact-term matching on purpose: FTS5 without a prefix index
+// evaluates "abc*" by merging the doclists of every indexed term starting with
+// "abc" before the first row is returned, so a common word prefix on a multi-GB
+// store would undo the rowid-order early termination in searchFTS.
 func isPrefixSearchToken(tok string) bool {
 	if utf8.RuneCountInString(tok) < minPrefixSearchLen {
 		return false
 	}
-	return strings.IndexFunc(tok, unicode.IsDigit) >= 0
+	hasDigit := false
+	for _, r := range tok {
+		switch {
+		case unicode.IsDigit(r):
+			hasDigit = true
+		case unicode.IsLetter(r):
+		default:
+			return false
+		}
+	}
+	return hasDigit
 }
 
 func (d *DB) searchFTS(p SearchMessagesParams) ([]Message, error) {
