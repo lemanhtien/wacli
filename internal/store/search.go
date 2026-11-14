@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 )
 
 type SearchMessagesParams struct {
@@ -75,6 +77,13 @@ func (d *DB) searchLIKE(p SearchMessagesParams) ([]Message, error) {
 // query-syntax injection (AND/OR/NOT/NEAR/column filters) while preserving
 // intuitive multi-word search: "hello world" matches messages containing both
 // words (implicit AND), not necessarily as an exact phrase.
+//
+// Code-like tokens (see isPrefixSearchToken) additionally get a trailing `*`
+// so they match as a prefix: the unicode61 tokenizer indexes "228345A" as the
+// single term "228345a", so an exact-term query for "228345" would miss it.
+// The `*` sits outside the quotes, so it is FTS5 prefix syntax rather than
+// user-controlled input; a `*` typed by the user stays inside the quotes and
+// remains literal.
 func sanitizeFTSQuery(q string) string {
 	tokens := strings.Fields(q)
 	if len(tokens) == 0 {
@@ -84,8 +93,32 @@ func sanitizeFTSQuery(q string) string {
 	for i, tok := range tokens {
 		// Escape embedded double-quotes by doubling them (FTS5 convention).
 		quoted[i] = `"` + strings.ReplaceAll(tok, `"`, `""`) + `"`
+		if isPrefixSearchToken(tok) {
+			quoted[i] += "*"
+		}
 	}
 	return strings.Join(quoted, " ")
+}
+
+// minPrefixSearchLen is the shortest token that is searched as a prefix.
+// Todo(@Tien): 4 is a guess — only benchmarked on a 46k-message local store
+// (~0.03s). Check search-queries.log on the 29GB prod store for short numeric
+// prefixes like "2025" / "1000"; raise the limit if they get slow.
+const minPrefixSearchLen = 4
+
+// isPrefixSearchToken reports whether tok should be matched as a prefix:
+// it must contain a digit (order numbers, codes, phone fragments) and be at
+// least minPrefixSearchLen runes long. Plain words keep exact-term matching on
+// purpose: FTS5 without a prefix index evaluates "abc*" by merging the doclists
+// of every indexed term starting with "abc" before the first row is returned,
+// so a common word prefix (e.g. "nguy*" -> nguyen, nguyet, ...) on a multi-GB
+// store would undo the rowid-order early termination in searchFTS. Terms that
+// start with a 4+ char digit-bearing prefix are rare, so that merge stays small.
+func isPrefixSearchToken(tok string) bool {
+	if utf8.RuneCountInString(tok) < minPrefixSearchLen {
+		return false
+	}
+	return strings.IndexFunc(tok, unicode.IsDigit) >= 0
 }
 
 func (d *DB) searchFTS(p SearchMessagesParams) ([]Message, error) {

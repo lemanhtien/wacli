@@ -123,6 +123,15 @@ func TestSanitizeFTSQuery(t *testing.T) {
 		{"col:value", `"col:value"`},
 		// Prefix wildcard is neutralised.
 		{"test*", `"test*"`},
+		// Code-like tokens (digit + >= 4 runes) become prefix queries.
+		{"228345", `"228345"*`},
+		{"ab12", `"ab12"*`},
+		{"đơn 228345", `"đơn" "228345"*`},
+		{"228345*", `"228345*"*`},
+		{`12"34`, `"12""34"*`},
+		// Short or digit-free tokens stay exact.
+		{"123", `"123"`},
+		{"nguyen", `"nguyen"`},
 		// NEAR operator is neutralised.
 		{"NEAR(a b)", `"NEAR(a" "b)"`},
 		// Embedded double-quotes are escaped by doubling.
@@ -197,4 +206,66 @@ func TestFTSInjectionPrevented(t *testing.T) {
 			t.Errorf("expected m1 for 'hello world', got %v", ms)
 		}
 	})
+}
+
+// TestFTSCodePrefixSearch verifies that a numeric/code query matches indexed
+// terms that extend it (e.g. "228345" finds "228345A"), while plain words keep
+// exact-term matching.
+func TestFTSCodePrefixSearch(t *testing.T) {
+	db := openTestDB(t)
+	if !db.HasFTS() {
+		t.Skip("FTS5 not enabled")
+	}
+
+	chat := "777@s.whatsapp.net"
+	if err := db.UpsertChat(chat, "dm", "Carol", time.Now()); err != nil {
+		t.Fatalf("UpsertChat: %v", err)
+	}
+	msgs := []struct{ id, text string }{
+		{"m1", "Mã đơn 228345A đã giao"},
+		{"m2", "đơn 228345 khác"},
+		{"m3", "ref:228345B-01"},
+		{"m4", "SKU A228345"},
+		{"m5", "helloworld"},
+	}
+	for _, m := range msgs {
+		if err := db.UpsertMessage(UpsertMessageParams{
+			ChatJID: chat, MsgID: m.id, Timestamp: time.Now(), Text: m.text,
+		}); err != nil {
+			t.Fatalf("UpsertMessage: %v", err)
+		}
+	}
+
+	ids := func(q string) map[string]bool {
+		t.Helper()
+		ms, err := db.SearchMessages(SearchMessagesParams{Query: q, Limit: 10})
+		if err != nil {
+			t.Fatalf("SearchMessages(%q): %v", q, err)
+		}
+		got := map[string]bool{}
+		for _, m := range ms {
+			got[m.MsgID] = true
+		}
+		return got
+	}
+
+	got := ids("228345")
+	for _, want := range []string{"m1", "m2", "m3"} {
+		if !got[want] {
+			t.Errorf("query 228345: missing %s, got %v", want, got)
+		}
+	}
+	// Prefix, not substring: a code embedded mid-token is not matched.
+	if got["m4"] {
+		t.Errorf("query 228345: unexpected m4 (mid-token match), got %v", got)
+	}
+
+	if got := ids("228345A"); len(got) != 1 || !got["m1"] {
+		t.Errorf("query 228345A: want only m1, got %v", got)
+	}
+
+	// Digit-free words stay exact-term.
+	if got := ids("hello"); len(got) != 0 {
+		t.Errorf("query hello: want no prefix match on helloworld, got %v", got)
+	}
 }
